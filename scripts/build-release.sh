@@ -5,6 +5,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Use project-local target dir (avoid sandbox or global CARGO_TARGET_DIR overrides)
+export CARGO_TARGET_DIR="$ROOT/target"
+
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
 mkdir -p dist
 
