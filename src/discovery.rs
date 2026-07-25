@@ -1,12 +1,13 @@
 use crate::protocol::SERVICE_TYPE;
 use anyhow::{Context, Result};
 use if_addrs::IfAddr;
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+use mdns_sd::{Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DiscoveredPeer {
     pub device_id: String,
     pub name: String,
@@ -17,6 +18,8 @@ pub struct DiscoveredPeer {
 pub struct Discovery {
     daemon: ServiceDaemon,
     service_name: String,
+    browse_rx: Receiver<ServiceEvent>,
+    peers: Arc<Mutex<HashMap<String, DiscoveredPeer>>>,
 }
 
 impl Discovery {
@@ -39,39 +42,59 @@ impl Discovery {
         )
         .context("build service info")?;
         daemon.register(info).context("register mDNS service")?;
+        let browse_rx = daemon.browse(SERVICE_TYPE).context("browse mDNS")?;
         Ok(Self {
             daemon,
             service_name,
+            browse_rx,
+            peers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    pub fn browse(&self) -> Result<Vec<DiscoveredPeer>> {
-        let receiver = self
-            .daemon
-            .browse(SERVICE_TYPE)
-            .context("browse mDNS")?;
-        let mut peers = Vec::new();
-        while let Ok(event) = receiver.recv_timeout(Duration::from_millis(50)) {
-            if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
-                let device_id = info
-                    .get_property("device_id")
-                    .map(|v| v.val_str().to_string())
-                    .unwrap_or_default();
-                let name = info
-                    .get_property("name")
-                    .map(|v| v.val_str().to_string())
-                    .unwrap_or_else(|| info.get_fullname().to_string());
+    /// Drain mDNS events and return the current peer list.
+    pub fn poll_peers(&self, own_device_id: &str) -> Result<Vec<DiscoveredPeer>> {
+        while let Ok(event) = self.browse_rx.recv_timeout(Duration::from_millis(50)) {
+            self.handle_event(event);
+        }
+
+        let cache = self.peers.lock().expect("peer cache lock");
+        Ok(cache
+            .values()
+            .filter(|p| p.device_id != own_device_id)
+            .cloned()
+            .collect())
+    }
+
+    fn handle_event(&self, event: ServiceEvent) {
+        match event {
+            ServiceEvent::ServiceResolved(info) => {
                 if let Some((addr, port)) = pick_addr(&info) {
-                    peers.push(DiscoveredPeer {
+                    let fullname = info.get_fullname().to_string();
+                    let device_id = info
+                        .get_property("device_id")
+                        .map(|v| v.val_str().to_string())
+                        .unwrap_or_else(|| fullname.clone());
+                    let name = info
+                        .get_property("name")
+                        .map(|v| v.val_str().to_string())
+                        .unwrap_or_else(|| fullname.clone());
+                    let peer = DiscoveredPeer {
                         device_id,
                         name,
                         addr,
                         port,
-                    });
+                    };
+                    self.peers
+                        .lock()
+                        .expect("peer cache lock")
+                        .insert(fullname, peer);
                 }
             }
+            ServiceEvent::ServiceRemoved(_ty, fullname) => {
+                self.peers.lock().expect("peer cache lock").remove(&fullname);
+            }
+            _ => {}
         }
-        Ok(peers)
     }
 
     pub fn stop(self) -> Result<()> {

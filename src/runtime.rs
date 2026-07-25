@@ -1,6 +1,5 @@
 use crate::config::{Identity, TrustStore};
 use crate::discovery::{DiscoveredPeer, Discovery, pick_listen_port};
-use crate::protocol::FileMeta;
 use crate::transfer::{begin_incoming, send_files, IncomingTransfer};
 use anyhow::Result;
 use std::net::{SocketAddr, TcpListener};
@@ -19,9 +18,8 @@ pub struct Peer {
 
 pub enum RuntimeEvent {
     PeersUpdated(Vec<Peer>),
-    IncomingOffer {
+    IncomingConnection {
         remote_name: String,
-        files: Vec<FileMeta>,
         pairing_code: String,
         needs_pairing: bool,
         transfer: IncomingTransfer,
@@ -33,6 +31,10 @@ pub enum RuntimeEvent {
     ReceiveFinished {
         ok: bool,
         message: String,
+    },
+    TransferProgress {
+        fraction: f32,
+        label: String,
     },
     Log(String),
 }
@@ -115,16 +117,15 @@ fn peer_loop(
     let mut last: Vec<Peer> = Vec::new();
     loop {
         thread::sleep(Duration::from_secs(2));
-        match discovery.browse() {
-            Ok(found) => {
-                let peers = found
+        match discovery.poll_peers(&identity.device_id) {
+            Ok(peers) => {
+                let mapped = peers
                     .into_iter()
-                    .filter(|p| p.device_id != identity.device_id)
                     .map(discovered_to_peer)
                     .collect::<Vec<_>>();
-                if peers.len() != last.len() || peers.iter().any(|p| !last.contains(p)) {
-                    last = peers.clone();
-                    let _ = event_tx.send(RuntimeEvent::PeersUpdated(peers));
+                if mapped.len() != last.len() || mapped.iter().any(|p| !last.contains(p)) {
+                    last = mapped.clone();
+                    let _ = event_tx.send(RuntimeEvent::PeersUpdated(mapped));
                 }
             }
             Err(err) => {
@@ -143,25 +144,25 @@ fn listen_loop(
     loop {
         match listener.accept() {
             Ok((stream, _addr)) => {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(120)));
+                let _ = stream.set_nonblocking(false);
                 let id = Arc::clone(&identity);
                 let trust = Arc::clone(&trust);
                 let event_tx = event_tx.clone();
                 thread::spawn(move || {
-                    let mut trust = trust.lock().expect("trust lock");
-                    match begin_incoming(&id, &mut trust, stream) {
+                    let trust = trust.lock().expect("trust lock");
+                    match begin_incoming(&id, &trust, stream) {
                         Ok(incoming) => {
-                            let _ = event_tx.send(RuntimeEvent::IncomingOffer {
+                            let _ = event_tx.send(RuntimeEvent::IncomingConnection {
                                 remote_name: incoming.remote.name.clone(),
-                                files: incoming.offer.files.clone(),
                                 pairing_code: incoming.pairing_code.clone(),
                                 needs_pairing: incoming.needs_pairing,
                                 transfer: incoming,
                             });
                         }
                         Err(err) => {
-                            let _ = event_tx.send(RuntimeEvent::Log(format!("incoming error: {err}")));
+                            let _ = event_tx.send(RuntimeEvent::Log(format!(
+                                "Incoming connection failed: {err}"
+                            )));
                         }
                     }
                 });
@@ -187,7 +188,13 @@ fn command_loop(
         match cmd {
             RuntimeCommand::Send { peer, paths } => {
                 let trust = trust.lock().expect("trust lock");
-                let result = send_files(&identity, &trust, peer.addr, &paths);
+                let event_tx = event_tx.clone();
+                let result = send_files(&identity, &trust, peer.addr, &paths, |fraction, label| {
+                    let _ = event_tx.send(RuntimeEvent::TransferProgress {
+                        fraction,
+                        label: label.to_string(),
+                    });
+                });
                 let msg = match &result {
                     Ok(r) => format!("Sent {} file(s) to {}", r.files_sent, peer.name),
                     Err(e) => format!("Send failed: {e}"),
@@ -199,9 +206,23 @@ fn command_loop(
             }
             RuntimeCommand::AcceptIncoming(transfer) => {
                 let mut trust = trust.lock().expect("trust lock");
-                let result = transfer.accept_and_save(&mut trust);
+                let event_tx = event_tx.clone();
+                let result = transfer.accept_and_save(&mut trust, |fraction, label| {
+                    let _ = event_tx.send(RuntimeEvent::TransferProgress {
+                        fraction,
+                        label: label.to_string(),
+                    });
+                });
                 let msg = match &result {
-                    Ok(r) => format!("Received {} file(s)", r.saved_paths.len()),
+                    Ok(r) => format!(
+                        "Received {} file(s): {}",
+                        r.saved_paths.len(),
+                        r.files
+                            .iter()
+                            .map(|f| f.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                     Err(e) => format!("Receive failed: {e}"),
                 };
                 let _ = event_tx.send(RuntimeEvent::ReceiveFinished {
