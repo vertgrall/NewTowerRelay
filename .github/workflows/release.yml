@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            name: macOS-AppleSilicon
+            target: aarch64-apple-darwin
+            artifact: NewTowerRelay-macOS-AppleSilicon
+          - os: macos-13
+            name: macOS-Intel
+            target: x86_64-apple-darwin
+            artifact: NewTowerRelay-macOS-Intel
+          - os: ubuntu-22.04
+            name: Linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            artifact: NewTowerRelay-Linux-x86_64
+          - os: windows-latest
+            name: Windows-x86_64
+            target: x86_64-pc-windows-msvc
+            artifact: NewTowerRelay-Windows-x86_64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libasound2-dev
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/new_tower_relay" "dist/${{ matrix.artifact }}"
+          chmod +x "dist/${{ matrix.artifact }}"
+
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Version = (Select-String -Path Cargo.toml -Pattern '^version' | Select-Object -First 1).Line -replace '.*"(.*)".*','$1'
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/${{ matrix.target }}/release/new_tower_relay.exe" "dist/${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  macos-universal:
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: actions/checkout@v4
+
+      - name: Create universal macOS binary
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          lipo -create \
+            artifacts/NewTowerRelay-macOS-Intel/NewTowerRelay-macOS-Intel \
+            artifacts/NewTowerRelay-macOS-AppleSilicon/NewTowerRelay-macOS-AppleSilicon \
+            -output "NewTowerRelay-${VERSION}-macOS-Universal"
+          chmod +x "NewTowerRelay-${VERSION}-macOS-Universal"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macOS-Universal
+          path: NewTowerRelay-*-macOS-Universal
+
+  release:
+    needs: [build, macos-universal]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -2,52 +2,25 @@
 
 Cross-platform encrypted file sharing for macOS, Linux, and Windows.
 
-## Principles
+## Get started
 
-- **Cross-platform** — one Rust codebase, native binaries per OS
-- **Encrypted** — end-to-end ChaCha20-Poly1305 after X25519 key exchange
-- **Easy** — auto-discover peers on LAN, drag-and-drop, accept/decline
-- **Trust** — pairing code on first contact; trusted devices remembered
+1. **Download** the executable for your platform → **[SETUP.md](SETUP.md)**
+2. **Run** it on two computers on the same Wi‑Fi
+3. **Send** files — encrypted, with accept/decline on the receiver
 
-## Run (development)
+No Rust or build tools needed for users.
 
-```bash
-cargo run
-```
+| Platform | Download |
+|----------|----------|
+| macOS | `NewTowerRelay-*-macOS-Universal` |
+| Linux | `NewTowerRelay-*-Linux-x86_64` |
+| Windows | `NewTowerRelay-*-Windows-x86_64.exe` |
 
-## Build release
+## How it works
 
-```bash
-# macOS (native arch)
-cargo build --release
+- Auto-discovers peers on your LAN
+- End-to-end encryption (X25519 + ChaCha20-Poly1305)
+- Pairing code on first contact; trusted devices remembered
 
-# Linux
-cargo build --release --target x86_64-unknown-linux-gnu
-
-# Windows (from Linux/macOS cross-compile or on Windows)
-cargo build --release --target x86_64-pc-windows-msvc
-```
-
-## Usage
-
-1. Launch **NewTowerRelay** on both computers (same Wi‑Fi/LAN).
-2. Wait for the other device to appear under **Nearby devices**.
-3. Select files (or drag-and-drop), pick a peer, click **Send encrypted**.
-4. On the receiver, verify the **pairing code** (first time only), then **Accept**.
-
-Received files are saved to the app data `Downloads/` folder (see `DESIGN.md`).
-
-## Project layout
-
-```
-src/
-  app.rs        — UI
-  runtime.rs    — background discovery, listener, commands
-  transfer.rs   — encrypted send/receive
-  crypto.rs     — X25519 + ChaCha20-Poly1305
-  discovery.rs  — mDNS LAN discovery
-  protocol.rs   — wire messages
-  config.rs     — identity + trust store
-```
-
-See [DESIGN.md](DESIGN.md) for architecture details.
+See [DESIGN.md](DESIGN.md) for architecture.  
+See [scripts/README.md](scripts/README.md) if you need to **build** executables for release.
