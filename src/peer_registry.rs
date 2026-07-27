@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 pub const PEER_TTL: Duration = Duration::from_secs(60);
 /// How long without a resolve before a peer is shown as stale (still listed).
 pub const STALE_AFTER: Duration = Duration::from_secs(15);
+/// Grace period after mDNS ServiceRemoved before evicting a peer.
+pub const REMOVAL_GRACE: Duration = STALE_AFTER;
 /// How long after first discovery a peer shows the "New" badge.
 pub const NEW_PEER_WINDOW: Duration = Duration::from_secs(60);
 
@@ -38,6 +40,8 @@ struct PeerRecord {
     last_seen: Instant,
     last_probe_ok: Option<Instant>,
     probe_failures: u8,
+    /// Set when mDNS reports ServiceRemoved; peer evicted after [`REMOVAL_GRACE`].
+    removed_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +100,8 @@ impl PeerRegistry {
                 record.port = peer.port;
                 record.session_epoch = peer.session_epoch;
                 record.last_seen = now;
+                record.removed_at = None;
+                record.probe_failures = 0;
             }
             None => {
                 self.peers.insert(
@@ -110,11 +116,24 @@ impl PeerRegistry {
                         last_seen: now,
                         last_probe_ok: None,
                         probe_failures: 0,
+                        removed_at: None,
                     },
                 );
             }
         }
         true
+    }
+
+    /// Mark a peer for deferred removal after mDNS ServiceRemoved (transient re-registrations).
+    pub fn mark_removed_by_fullname(&mut self, mdns_fullname: &str, now: Instant) -> bool {
+        let Some(device_id) = self.fullname_index.get(mdns_fullname).cloned() else {
+            return false;
+        };
+        if let Some(record) = self.peers.get_mut(&device_id) {
+            record.removed_at = Some(now);
+            return true;
+        }
+        false
     }
 
     pub fn remove_by_fullname(&mut self, mdns_fullname: &str) -> Option<String> {
@@ -138,6 +157,24 @@ impl PeerRegistry {
             .peers
             .iter()
             .filter(|(_, record)| now.duration_since(record.last_seen) > PEER_TTL)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &expired {
+            self.remove_by_device_id(id);
+        }
+        expired
+    }
+
+    /// Drop peers marked removed by mDNS that have exceeded [`REMOVAL_GRACE`].
+    pub fn evict_pending_removals(&mut self, now: Instant) -> Vec<String> {
+        let expired: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .removed_at
+                    .is_some_and(|t| now.duration_since(t) > REMOVAL_GRACE)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in &expired {
@@ -605,6 +642,99 @@ mod tests {
             .map(|p| p.name)
             .collect();
         assert_eq!(names, vec!["Alpha", "Zulu"]);
+    }
+
+    #[test]
+    fn upsert_resets_probe_failures() {
+        let mut registry = PeerRegistry::new();
+        let now = Instant::now();
+        upsert(
+            &mut registry,
+            "dev-a",
+            "Mac",
+            [192, 168, 1, 5],
+            9000,
+            "mac.local",
+            1,
+            now,
+        );
+        for _ in 0..PROBE_FAILURES_OFFLINE {
+            registry.record_probe_result("dev-a", false, now);
+        }
+        assert_eq!(
+            registry.visible_peers(now, "self")[0].presence,
+            PeerPresence::Stale
+        );
+
+        upsert(
+            &mut registry,
+            "dev-a",
+            "Mac",
+            [192, 168, 1, 5],
+            9000,
+            "mac.local",
+            1,
+            now,
+        );
+        assert_eq!(
+            registry.visible_peers(now, "self")[0].presence,
+            PeerPresence::Online
+        );
+    }
+
+    #[test]
+    fn mark_removed_defers_eviction_until_grace_expires() {
+        let mut registry = PeerRegistry::new();
+        let now = Instant::now();
+        upsert(
+            &mut registry,
+            "dev-a",
+            "Mac",
+            [192, 168, 1, 5],
+            9000,
+            "mac.local",
+            1,
+            now,
+        );
+        let recent_mark = Instant::now() - Duration::from_secs(5);
+        assert!(registry.mark_removed_by_fullname("mac.local", recent_mark));
+        assert_eq!(registry.visible_peers(now, "self").len(), 1);
+        registry.evict_pending_removals(Instant::now());
+        assert_eq!(registry.visible_peers(now, "self").len(), 1);
+
+        let stale_mark = Instant::now() - REMOVAL_GRACE - Duration::from_secs(1);
+        registry.mark_removed_by_fullname("mac.local", stale_mark);
+        registry.evict_pending_removals(Instant::now());
+        assert!(registry.visible_peers(Instant::now(), "self").is_empty());
+    }
+
+    #[test]
+    fn upsert_clears_pending_removal() {
+        let mut registry = PeerRegistry::new();
+        let now = Instant::now();
+        upsert(
+            &mut registry,
+            "dev-a",
+            "Mac",
+            [192, 168, 1, 5],
+            9000,
+            "mac.local",
+            1,
+            now,
+        );
+        registry.mark_removed_by_fullname("mac.local", t(10));
+        upsert(
+            &mut registry,
+            "dev-a",
+            "Mac",
+            [192, 168, 1, 5],
+            9000,
+            "mac.local",
+            1,
+            now,
+        );
+        registry.evict_pending_removals(t(20));
+        assert_eq!(registry.visible_peers(now, "self").len(), 1);
     }
 
     #[test]

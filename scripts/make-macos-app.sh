@@ -49,6 +49,16 @@ cat > "$CONTENTS/Info.plist" <<EOF
   <string>NTRelay</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
+  <key>CFBundleIcons</key>
+  <dict>
+    <key>CFBundlePrimaryIcon</key>
+    <dict>
+      <key>CFBundleIconFiles</key>
+      <array>
+        <string>AppIcon</string>
+      </array>
+    </dict>
+  </dict>
   <key>CFBundleIdentifier</key>
   <string>com.newtower.relay</string>
   <key>CFBundleName</key>

@@ -172,6 +172,7 @@ fn peer_loop(
         }
     };
     let mut last: Vec<Peer> = Vec::new();
+    let mut force_peers_update = false;
     loop {
         thread::sleep(Duration::from_secs(2));
 
@@ -179,6 +180,7 @@ fn peer_loop(
             match discovery.rescan() {
                 Ok(()) => {
                     last.clear();
+                    force_peers_update = true;
                     let _ = event_tx.send(RuntimeEvent::Log(
                         "Network rescan started — searching for devices…".to_string(),
                     ));
@@ -195,8 +197,9 @@ fn peer_loop(
                     .into_iter()
                     .map(snapshot_to_peer)
                     .collect::<Vec<_>>();
-                if peers_changed(&last, &mapped) {
+                if force_peers_update || peers_changed(&last, &mapped) {
                     last = mapped.clone();
+                    force_peers_update = false;
                     let _ = event_tx.send(RuntimeEvent::PeersUpdated(mapped));
                 }
             }
@@ -547,5 +550,10 @@ mod tests {
         let a = vec![sample_peer("a", PeerPresence::Online, false)];
         let b = vec![sample_peer("a", PeerPresence::Online, false)];
         assert!(!peers_changed(&a, &b));
+    }
+
+    #[test]
+    fn peers_changed_empty_lists_need_force_flag_after_rescan() {
+        assert!(!peers_changed(&[], &[]));
     }
 }

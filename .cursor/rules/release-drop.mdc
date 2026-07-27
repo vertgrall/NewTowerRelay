@@ -1,0 +1,27 @@
+---
+description: Build release artifacts to the drop folder after features, fixes, or UI changes
+alwaysApply: true
+---
+
+# Release drop folder
+
+After completing **features**, **bug fixes**, or **UI changes** in NewTowerRelay, run a release build into the drop folder before finishing.
+
+## Drop location
+
+`~/Desktop/NewTowerBuilds` (override with `DROP_DIR` env var)
+
+## Command
+
+```bash
+cd /Users/jon/Documents/Code/Rust/NewTowerRelay
+chmod +x scripts/drop-release.sh
+./scripts/drop-release.sh
+```
+
+This produces Mac SKUs, `NewTowerRelay.app`, and a Linux `.deb` when Docker is available.
+
+## When to skip
+
+- Docs-only or comment-only edits
+- Work-in-progress the user explicitly asked not to build yet

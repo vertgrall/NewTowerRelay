@@ -88,6 +88,7 @@ impl Discovery {
 
         let mut registry = self.registry.lock().expect("peer registry lock");
         registry.evict_expired(now);
+        registry.evict_pending_removals(now);
         Ok(registry.visible_peers(now, own_device_id))
     }
 
@@ -110,11 +111,6 @@ impl Discovery {
 
         self.last_addrs = current.clone();
         self.network_change_at = None;
-
-        {
-            let mut registry = self.registry.lock().expect("peer registry lock");
-            registry.clear();
-        }
 
         self.reregister(&current)
     }
@@ -193,7 +189,7 @@ impl Discovery {
                 }
             }
             ServiceEvent::ServiceRemoved(_ty, fullname) => {
-                registry.remove_by_fullname(&fullname);
+                registry.mark_removed_by_fullname(&fullname, now);
             }
             _ => {}
         }
@@ -238,10 +234,36 @@ pub fn pick_listen_port() -> Result<(TcpListener, u16)> {
 
 fn pick_addr(info: &ServiceInfo) -> Option<(IpAddr, u16)> {
     let port = info.get_port();
-    info.get_addresses()
+    let addrs: Vec<IpAddr> = info
+        .get_addresses()
         .iter()
-        .find(|ip| ip.is_ipv4())
-        .map(|ip| (*ip, port))
+        .copied()
+        .filter(IpAddr::is_ipv4)
+        .collect();
+    if addrs.is_empty() {
+        return None;
+    }
+    if let Some(addr) = prefer_local_subnet(&addrs, &local_ipv4_addrs()) {
+        return Some((addr, port));
+    }
+    Some((addrs[0], port))
+}
+
+fn prefer_local_subnet(candidates: &[IpAddr], local: &[IpAddr]) -> Option<IpAddr> {
+    for local_ip in local {
+        let IpAddr::V4(local_v4) = local_ip else {
+            continue;
+        };
+        let local_prefix = &local_v4.octets()[..3];
+        for candidate in candidates {
+            if let IpAddr::V4(candidate_v4) = candidate {
+                if &candidate_v4.octets()[..3] == local_prefix {
+                    return Some(*candidate);
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn local_ipv4_addrs() -> Vec<IpAddr> {
@@ -342,6 +364,19 @@ mod tests {
         let mut b = a.clone();
         b.sort();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn prefer_local_subnet_picks_lan_address() {
+        let candidates = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+        ];
+        let local = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))];
+        assert_eq!(
+            prefer_local_subnet(&candidates, &local),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)))
+        );
     }
 
     #[test]

@@ -2,6 +2,19 @@
 
 End users download executables from Releases — they do **not** need these scripts.
 
+## Drop folder (local testing builds)
+
+After features, bug fixes, or UI changes, build into **`~/Desktop/NewTowerBuilds`**:
+
+```bash
+chmod +x scripts/drop-release.sh
+./scripts/drop-release.sh
+```
+
+Override the path with `DROP_DIR=/path/to/folder ./scripts/drop-release.sh`.
+
+Produces Mac SKUs, `NewTowerRelay.app`, and Linux `.deb` (when Docker is available).
+
 ## macOS — build once, use forever
 
 Requires [Rust](https://rustup.rs/) only for **building**, not for daily use.

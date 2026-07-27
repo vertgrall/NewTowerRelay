@@ -3,7 +3,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="${1:-$ROOT/dist/NTRelay.app}"
+# shellcheck source=scripts/drop-dir.sh
+source "$ROOT/scripts/drop-dir.sh"
+SRC="${1:-$DROP_DIR/NewTowerRelay.app}"
+if [[ ! -d "$SRC" && -d "$ROOT/dist/NTRelay.app" ]]; then
+  SRC="$ROOT/dist/NTRelay.app"
+fi
 DEST="$HOME/Applications/NTRelay.app"
 
 if [[ ! -d "$SRC" ]]; then

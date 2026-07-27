@@ -324,7 +324,7 @@ impl RelayApp {
         ui.horizontal(|ui| {
             if blue_button(
                 ui,
-                "↻  Rescan network",
+                "Rescan network",
                 true,
                 false,
                 egui::vec2(ui.available_width(), 36.0),
@@ -682,8 +682,8 @@ impl RelayApp {
 }
 
 impl eframe::App for RelayApp {
-    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Rgba::from(glass_fill(visuals.dark_mode)).to_array()
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1058,23 +1058,32 @@ fn button_style(
 
 fn glass_fill(dark: bool) -> egui::Color32 {
     if dark {
-        egui::Color32::from_rgba_unmultiplied(24, 26, 32, 238)
+        egui::Color32::from_rgba_unmultiplied(24, 26, 32, 200)
     } else {
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 232)
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 205)
+    }
+}
+
+fn glass_border(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(15, 23, 42, 22)
     }
 }
 
 fn card_fill(dark: bool) -> egui::Color32 {
     if dark {
-        egui::Color32::from_rgba_unmultiplied(38, 42, 52, 210)
+        egui::Color32::from_rgba_unmultiplied(38, 42, 52, 185)
     } else {
-        egui::Color32::from_rgba_unmultiplied(255, 251, 235, 220)
+        egui::Color32::from_rgba_unmultiplied(255, 251, 235, 195)
     }
 }
 
 fn app_shell_frame(dark: bool) -> egui::Frame {
     egui::Frame::new()
         .fill(glass_fill(dark))
+        .stroke(egui::Stroke::new(1.0_f32, glass_border(dark)))
         .inner_margin(egui::Margin::symmetric(18, 16))
 }
 
@@ -1094,11 +1103,11 @@ fn apply_theme(ctx: &egui::Context, theme: egui::Theme) {
     if visuals.dark_mode {
         visuals.panel_fill = egui::Color32::TRANSPARENT;
         visuals.window_fill = egui::Color32::TRANSPARENT;
-        visuals.extreme_bg_color = glass_fill(true);
+        visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
     } else {
         visuals.panel_fill = egui::Color32::TRANSPARENT;
         visuals.window_fill = egui::Color32::TRANSPARENT;
-        visuals.extreme_bg_color = glass_fill(false);
+        visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
     }
 
     visuals.window_corner_radius = egui::CornerRadius::ZERO;
@@ -1139,6 +1148,15 @@ fn apply_theme(ctx: &egui::Context, theme: egui::Theme) {
     ctx.set_style(style);
 }
 
+/// macOS `.app` bundles already supply a Dock icon via `AppIcon.icns`.
+/// Setting a runtime icon there overrides it and can clear the icon if loading fails.
+#[cfg(target_os = "macos")]
+fn running_from_app_bundle() -> bool {
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|path| path.to_string_lossy().contains(".app/Contents/MacOS/"))
+}
+
 pub fn run(identity: Identity, trust: TrustStore) -> eframe::Result<()> {
     let runtime = crate::runtime::spawn(identity.clone(), trust)
         .map_err(|e| eframe::Error::AppCreation(format!("{e}").into()))?;
@@ -1151,14 +1169,26 @@ pub fn run(identity: Identity, trust: TrustStore) -> eframe::Result<()> {
             .expect("load app icon"),
     );
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([W, H])
+        .with_min_inner_size([W, H])
+        .with_max_inner_size([W, H])
+        .with_resizable(false)
+        .with_transparent(true)
+        .with_title("NTRelay");
+
+    #[cfg(target_os = "macos")]
+    if !running_from_app_bundle() {
+        viewport = viewport.with_icon(icon);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([W, H])
-            .with_min_inner_size([W, H])
-            .with_max_inner_size([W, H])
-            .with_resizable(false)
-            .with_title("NTRelay")
-            .with_icon(icon),
+        viewport,
         ..Default::default()
     };
 

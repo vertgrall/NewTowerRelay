@@ -4,9 +4,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+# shellcheck source=scripts/drop-dir.sh
+source "$ROOT/scripts/drop-dir.sh"
 
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
-OUT="${1:-$HOME/Desktop/NewTowerBuidls}"
+OUT="${1:-$DROP_DIR}"
 export CARGO_TARGET_DIR="$ROOT/target"
 
 mkdir -p "$OUT"
