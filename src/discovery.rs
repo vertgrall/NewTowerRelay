@@ -1,3 +1,4 @@
+use crate::peer_registry::{PeerRegistry, PeerSnapshot, PeerUpsert};
 use crate::protocol::SERVICE_TYPE;
 use anyhow::{Context, Result};
 use if_addrs::IfAddr;
@@ -5,7 +6,7 @@ use mdns_sd::{Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DiscoveredPeer {
@@ -19,7 +20,7 @@ pub struct Discovery {
     daemon: ServiceDaemon,
     service_name: String,
     browse_rx: Receiver<ServiceEvent>,
-    peers: Arc<Mutex<HashMap<String, DiscoveredPeer>>>,
+    registry: Arc<Mutex<PeerRegistry>>,
 }
 
 impl Discovery {
@@ -47,25 +48,31 @@ impl Discovery {
             daemon,
             service_name,
             browse_rx,
-            peers: Arc::new(Mutex::new(HashMap::new())),
+            registry: Arc::new(Mutex::new(PeerRegistry::new())),
         })
     }
 
-    /// Drain mDNS events and return the current peer list.
-    pub fn poll_peers(&self, own_device_id: &str) -> Result<Vec<DiscoveredPeer>> {
+    /// For unit tests: registry handle without starting mDNS.
+    #[cfg(test)]
+    pub fn registry(&self) -> Arc<Mutex<PeerRegistry>> {
+        Arc::clone(&self.registry)
+    }
+
+    /// Drain mDNS events and return the current visible peer list.
+    pub fn poll_peers(&self, own_device_id: &str) -> Result<Vec<PeerSnapshot>> {
         while let Ok(event) = self.browse_rx.recv_timeout(Duration::from_millis(50)) {
             self.handle_event(event);
         }
 
-        let cache = self.peers.lock().expect("peer cache lock");
-        Ok(cache
-            .values()
-            .filter(|p| p.device_id != own_device_id)
-            .cloned()
-            .collect())
+        let now = Instant::now();
+        let mut registry = self.registry.lock().expect("peer registry lock");
+        registry.evict_expired(now);
+        Ok(registry.visible_peers(now, own_device_id))
     }
 
     fn handle_event(&self, event: ServiceEvent) {
+        let now = Instant::now();
+        let mut registry = self.registry.lock().expect("peer registry lock");
         match event {
             ServiceEvent::ServiceResolved(info) => {
                 if let Some((addr, port)) = pick_addr(&info) {
@@ -78,20 +85,20 @@ impl Discovery {
                         .get_property("name")
                         .map(|v| v.val_str().to_string())
                         .unwrap_or_else(|| fullname.clone());
-                    let peer = DiscoveredPeer {
-                        device_id,
-                        name,
-                        addr,
-                        port,
-                    };
-                    self.peers
-                        .lock()
-                        .expect("peer cache lock")
-                        .insert(fullname, peer);
+                    registry.upsert(
+                        PeerUpsert {
+                            device_id,
+                            name,
+                            addr,
+                            port,
+                            mdns_fullname: fullname,
+                        },
+                        now,
+                    );
                 }
             }
             ServiceEvent::ServiceRemoved(_ty, fullname) => {
-                self.peers.lock().expect("peer cache lock").remove(&fullname);
+                registry.remove_by_fullname(&fullname);
             }
             _ => {}
         }
@@ -140,4 +147,65 @@ fn sanitize(input: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn registry_dedupes_by_device_id_via_shared_state() {
+        let registry = Arc::new(Mutex::new(PeerRegistry::new()));
+        let now = Instant::now();
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.upsert(
+                PeerUpsert {
+                    device_id: "dev-1".into(),
+                    name: "Laptop".into(),
+                    addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                    port: 8000,
+                    mdns_fullname: "old-instance.local".into(),
+                },
+                now,
+            );
+            reg.upsert(
+                PeerUpsert {
+                    device_id: "dev-1".into(),
+                    name: "Laptop".into(),
+                    addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                    port: 8001,
+                    mdns_fullname: "new-instance.local".into(),
+                },
+                now,
+            );
+        }
+        let reg = registry.lock().unwrap();
+        let peers = reg.visible_peers(now, "self");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].addr, SocketAddr::from(([10, 0, 0, 2], 8001)));
+    }
+
+    #[test]
+    fn remove_by_fullname_clears_device() {
+        let registry = Arc::new(Mutex::new(PeerRegistry::new()));
+        let now = Instant::now();
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.upsert(
+                PeerUpsert {
+                    device_id: "dev-1".into(),
+                    name: "Laptop".into(),
+                    addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                    port: 8000,
+                    mdns_fullname: "laptop.local".into(),
+                },
+                now,
+            );
+            assert_eq!(reg.remove_by_fullname("laptop.local"), Some("dev-1".into()));
+        }
+        let reg = registry.lock().unwrap();
+        assert!(reg.visible_peers(now, "self").is_empty());
+    }
 }

@@ -15,7 +15,8 @@ Each release includes **four executables** — pick the one for your system:
 | **macOS** (recommended) | `NewTowerRelay-*-macOS-Universal` | Any Mac — Intel and Apple Silicon |
 | **macOS** (Intel only) | `NewTowerRelay-*-macOS-Intel` | Older Intel Macs |
 | **macOS** (Apple Silicon) | `NewTowerRelay-*-macOS-AppleSilicon` | M1/M2/M3/M4 Macs |
-| **Linux** | `NewTowerRelay-*-Linux-x86_64` | Most Linux PCs (64-bit) |
+| **Linux** (recommended) | `ntrelay_*_amd64.deb` | Mint, Ubuntu, Debian — double-click or `apt install` |
+| **Linux** (portable) | `NewTowerRelay-*-Linux-x86_64` | Run without installing |
 | **Windows** | `NewTowerRelay-*-Windows-x86_64.exe` | Windows 10/11 (64-bit) |
 
 Published on the project **Releases** page when you tag a version (e.g. `v0.1.0`).  
@@ -41,6 +42,19 @@ chmod +x ~/Downloads/NewTowerRelay-*-macOS-Universal
 ---
 
 ## Linux
+
+**Recommended — `.deb` installer** (Mint, Ubuntu, Debian):
+
+1. Download `ntrelay_*_amd64.deb` from Releases.
+2. Double-click the file, or run:
+
+```bash
+sudo apt install ./ntrelay_0.1.0_amd64.deb
+```
+
+This installs **NTRelay** to your app menu, puts `ntrelay` on your PATH, and sets up Avahi for device discovery.
+
+**Standalone binary** (no install):
 
 1. Download `NewTowerRelay-*-Linux-x86_64`.
 2. Make it executable and run:

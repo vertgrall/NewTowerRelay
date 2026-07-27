@@ -59,8 +59,36 @@ jobs:
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/new_tower_relay" "dist/${{ matrix.artifact }}"
-          chmod +x "dist/${{ matrix.artifact }}"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            OUT="dist/NewTowerRelay-${VERSION}-Linux-x86_64"
+          else
+            OUT="dist/${{ matrix.artifact }}"
+          fi
+          cp "target/${{ matrix.target }}/release/new_tower_relay" "$OUT"
+          chmod +x "$OUT"
+
+      - name: Build .deb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y dpkg-dev
+          ./scripts/build-deb.sh dist
+          ls -lh dist/
+
+      - name: Upload artifact (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/NewTowerRelay-*-Linux-x86_64
+            dist/ntrelay_*_amd64.deb
+
+      - name: Upload artifact (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
 
       - name: Prepare artifact (Windows)
         if: runner.os == 'Windows'
@@ -71,6 +99,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/new_tower_relay.exe" "dist/${{ matrix.artifact }}"
 
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}

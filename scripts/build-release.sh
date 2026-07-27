@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
-# Build a release executable for the current platform into dist/
+# Build release executable(s) and a double-clickable app bundle where supported.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Use project-local target dir (avoid sandbox or global CARGO_TARGET_DIR overrides)
 export CARGO_TARGET_DIR="$ROOT/target"
-
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
 mkdir -p dist
 
-echo "Building NewTowerRelay v${VERSION}..."
+echo "Building NTRelay v${VERSION}..."
 
 case "$(uname -s)" in
   Darwin)
@@ -22,27 +20,32 @@ case "$(uname -s)" in
       *)      LABEL="macOS-${ARCH}" ;;
     esac
 
-    # Universal binary when both macOS targets are installed
     if rustup target list --installed | grep -q x86_64-apple-darwin && \
        rustup target list --installed | grep -q aarch64-apple-darwin; then
       echo "Building universal macOS binary..."
       cargo build --release --target x86_64-apple-darwin
       cargo build --release --target aarch64-apple-darwin
-      OUT="dist/NewTowerRelay-${VERSION}-macOS-Universal"
+      BIN="dist/NewTowerRelay-${VERSION}-macOS-Universal"
       lipo -create \
         target/x86_64-apple-darwin/release/new_tower_relay \
         target/aarch64-apple-darwin/release/new_tower_relay \
-        -output "$OUT"
-      chmod +x "$OUT"
-      echo "→ $OUT"
+        -output "$BIN"
+      chmod +x "$BIN"
+      echo "→ $BIN"
     else
       cargo build --release
-      OUT="dist/NewTowerRelay-${VERSION}-${LABEL}"
-      cp target/release/new_tower_relay "$OUT"
-      chmod +x "$OUT"
-      echo "→ $OUT"
+      BIN="dist/NewTowerRelay-${VERSION}-${LABEL}"
+      cp target/release/new_tower_relay "$BIN"
+      chmod +x "$BIN"
+      echo "→ $BIN"
       echo "Tip: install both macOS rust targets for a universal binary."
     fi
+
+    echo "Packaging NTRelay.app..."
+    "$ROOT/scripts/make-macos-app.sh" "$BIN" "$ROOT/dist/NTRelay.app"
+    echo ""
+    echo "Done. To install permanently:"
+    echo "  ./scripts/install-macos.sh"
     ;;
   Linux)
     cargo build --release
@@ -50,6 +53,10 @@ case "$(uname -s)" in
     cp target/release/new_tower_relay "$OUT"
     chmod +x "$OUT"
     echo "→ $OUT"
+    "$ROOT/scripts/make-linux-desktop.sh" "$OUT" "$ROOT/dist"
+    "$ROOT/scripts/build-deb.sh" "$ROOT/dist"
+    echo ""
+    echo "Install: sudo apt install ./dist/ntrelay_${VERSION}_amd64.deb"
     ;;
   MINGW*|MSYS*|CYGWIN*)
     cargo build --release

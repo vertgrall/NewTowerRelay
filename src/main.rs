@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod crypto;
 mod discovery;
+mod peer_registry;
 mod protocol;
 mod runtime;
 mod transfer;

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use rand::rngs::OsRng;
@@ -50,9 +50,22 @@ impl Identity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerTrust {
+    Unknown,
+    Verified,
+    KeyMismatch,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrustStore {
-    pub trusted_peers: HashSet<String>,
+    /// device_id -> base64-encoded X25519 public key
+    peers: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct LegacyTrustStore {
+    trusted_peers: Vec<String>,
 }
 
 impl TrustStore {
@@ -64,10 +77,18 @@ impl TrustStore {
         if !path.exists() {
             return Self::default();
         }
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => return Self::default(),
+        };
+        if let Ok(store) = serde_json::from_str::<TrustStore>(&raw) {
+            return store;
+        }
+        // Legacy format stored device IDs only — discard and require re-pairing with pinned keys.
+        if serde_json::from_str::<LegacyTrustStore>(&raw).is_ok() {
+            return Self::default();
+        }
+        Self::default()
     }
 
     pub fn save(&self) -> Result<()> {
@@ -76,12 +97,28 @@ impl TrustStore {
         Ok(())
     }
 
-    pub fn trust(&mut self, device_id: &str) {
-        self.trusted_peers.insert(device_id.to_string());
+    pub fn trust_peer(&mut self, device_id: &str, public_key_b64: &str) {
+        self.peers
+            .insert(device_id.to_string(), public_key_b64.to_string());
     }
 
-    pub fn is_trusted(&self, device_id: &str) -> bool {
-        self.trusted_peers.contains(device_id)
+    pub fn check_peer(&self, device_id: &str, public_key_b64: &str) -> PeerTrust {
+        match self.peers.get(device_id) {
+            None => PeerTrust::Unknown,
+            Some(stored) if stored == public_key_b64 => PeerTrust::Verified,
+            Some(_) => PeerTrust::KeyMismatch,
+        }
+    }
+
+    pub fn is_pinned(&self, device_id: &str, public_key_b64: &str) -> bool {
+        matches!(
+            self.check_peer(device_id, public_key_b64),
+            PeerTrust::Verified
+        )
+    }
+
+    pub fn has_entry(&self, device_id: &str) -> bool {
+        self.peers.contains_key(device_id)
     }
 }
 
@@ -96,11 +133,45 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 pub fn download_dir() -> Result<PathBuf> {
-    let dir = ProjectDirs::from(APP_QUALIFIER, APP_ORG, APP_NAME)
-        .map(|dirs| dirs.data_dir().join("Downloads"))
-        .context("resolve data directory")?;
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
+    #[cfg(test)]
+    if let Some(dir) = test_download_override() {
+        fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
+
+    if let Some(user_dirs) = directories::UserDirs::new() {
+        if let Some(downloads) = user_dirs.download_dir() {
+            let dir = downloads.to_path_buf();
+            fs::create_dir_all(&dir)?;
+            return Ok(dir);
+        }
+    }
+
+    if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
+        let dir = home.join("Downloads");
+        fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
+
+    Err(anyhow::anyhow!("could not resolve Downloads folder"))
+}
+
+#[cfg(test)]
+fn test_download_override() -> Option<PathBuf> {
+    use std::cell::RefCell;
+    thread_local! {
+        static OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+    OVERRIDE.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+pub fn set_download_dir_for_tests(dir: PathBuf) {
+    use std::cell::RefCell;
+    thread_local! {
+        static OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+    OVERRIDE.with(|slot| *slot.borrow_mut() = Some(dir));
 }
 
 fn default_device_name() -> String {
@@ -116,4 +187,18 @@ fn uuid_simple() -> String {
     (0..16)
         .map(|_| format!("{:02x}", rng.gen::<u8>()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trust_store_pins_public_keys() {
+        let mut store = TrustStore::default();
+        store.trust_peer("dev-a", "pk-a");
+        assert_eq!(store.check_peer("dev-a", "pk-a"), PeerTrust::Verified);
+        assert_eq!(store.check_peer("dev-a", "pk-b"), PeerTrust::KeyMismatch);
+        assert_eq!(store.check_peer("dev-b", "pk-a"), PeerTrust::Unknown);
+    }
 }
