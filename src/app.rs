@@ -147,6 +147,14 @@ impl RelayApp {
                     self.transfer_progress = Some(fraction.clamp(0.0, 1.0));
                     self.transfer_label = label;
                 }
+                RuntimeEvent::TransferCancelled { message } => {
+                    self.transfer_progress = None;
+                    self.transfer_label.clear();
+                    self.pending_send_pairing = None;
+                    self.pending_incoming = None;
+                    self.set_status(StatusKind::Info, message.clone());
+                    self.log(false, message);
+                }
                 RuntimeEvent::SendFinished { ok, message } => {
                     self.transfer_progress = None;
                     self.transfer_label.clear();
@@ -223,22 +231,48 @@ impl RelayApp {
         ui.add_space(6.0);
     }
 
-    fn draw_progress(&self, ui: &mut egui::Ui) {
+    fn draw_progress(&mut self, ui: &mut egui::Ui) {
         if let Some(fraction) = self.transfer_progress {
             ui.add_space(4.0);
-            let label = if self.transfer_label.is_empty() {
-                format!("{:.0}%", fraction * 100.0)
-            } else {
-                self.transfer_label.clone()
-            };
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .fill(BTN_GREEN)
-                    .animate(true)
-                    .text(label)
-                    .corner_radius(CARD_RADIUS),
-            );
+            ui.horizontal(|ui| {
+                let label = if self.transfer_label.is_empty() {
+                    format!("{:.0}%", fraction * 100.0)
+                } else {
+                    self.transfer_label.clone()
+                };
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .fill(BTN_GREEN)
+                        .animate(true)
+                        .text(label)
+                        .corner_radius(CARD_RADIUS),
+                );
+                if blue_button(ui, "Cancel", true, false, egui::vec2(72.0, 36.0), 13.0).clicked()
+                {
+                    self.runtime.cancel_transfer();
+                    self.set_status(StatusKind::Info, "Cancelling transfer…");
+                }
+            });
             ui.add_space(6.0);
+        }
+    }
+
+    fn transfer_in_progress(&self) -> bool {
+        self.transfer_progress.is_some()
+    }
+
+    fn cancel_workflow(&mut self) {
+        if self.transfer_in_progress() || self.pending_send_pairing.is_some() {
+            self.runtime.cancel_transfer();
+            self.set_status(StatusKind::Info, "Cancelling transfer…");
+            return;
+        }
+        if let Some(pending) = self.pending_incoming.as_mut() {
+            if let Some(transfer) = pending.transfer.take() {
+                self.runtime.decline(transfer);
+            }
+            self.pending_incoming = None;
+            self.set_status(StatusKind::Info, "Incoming transfer declined".to_string());
         }
     }
 
@@ -287,6 +321,23 @@ impl RelayApp {
         }
 
         ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            if blue_button(
+                ui,
+                "↻  Rescan network",
+                true,
+                false,
+                egui::vec2(ui.available_width(), 36.0),
+                13.0,
+            )
+            .clicked()
+            {
+                self.runtime.rescan_network();
+                self.set_status(StatusKind::Info, "Rescanning network…");
+            }
+        });
+        ui.add_space(6.0);
 
         if self.peers.is_empty() {
             ui.label(
@@ -593,6 +644,19 @@ impl RelayApp {
             return;
         }
 
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if blue_button(ui, "Clear", !self.logs.is_empty(), false, egui::vec2(72.0, 32.0), 12.0)
+                    .clicked()
+                {
+                    self.logs.clear();
+                    if self.status_kind != StatusKind::Error {
+                        self.set_status(StatusKind::Ready, "Activity cleared");
+                    }
+                }
+            });
+        });
         ui.add_space(4.0);
         egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
             if self.logs.is_empty() {

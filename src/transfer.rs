@@ -78,6 +78,7 @@ pub fn send_files_on_connection<F>(
     remote: &Hello,
     cipher: &ChaCha20Poly1305,
     paths: &[PathBuf],
+    pairing_code: Option<&str>,
     mut on_progress: F,
 ) -> Result<SendResult>
 where
@@ -94,6 +95,11 @@ where
                 "unexpected response while waiting for acceptance: {other:?}"
             ));
         }
+    }
+
+    if let Some(code) = pairing_code {
+        on_progress(0.09, "Sending pairing code…");
+        send_pairing_message(stream, cipher, code)?;
     }
 
     let files = collect_files(paths)?;
@@ -159,15 +165,16 @@ where
         connect_and_handshake(identity, trust, addr, peer_device_id)?;
     on_progress(0.05, "Handshaking…");
 
-    if handshake.needs_pairing_confirm {
-        send_pairing_message(&mut stream, &handshake.cipher, &handshake.pairing_code)?;
-    }
+    let pairing_code = handshake
+        .needs_pairing_confirm
+        .then_some(handshake.pairing_code.as_str());
 
     send_files_on_connection(
         &mut stream,
         &handshake.remote,
         &handshake.cipher,
         paths,
+        pairing_code,
         &mut on_progress,
     )
 }
@@ -341,6 +348,28 @@ impl IncomingTransfer {
             "decline connection",
         )
     }
+
+    /// Drop the connection without completing the transfer (used when the other side cancelled).
+    pub fn abort(self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    pub fn track_for_cancel(&self, active: &std::sync::Mutex<Option<TcpStream>>) {
+        if let Ok(clone) = self.stream.try_clone() {
+            *active.lock().expect("active stream lock") = Some(clone);
+        }
+    }
+}
+
+/// Best-effort decline before closing an outbound connection.
+pub fn cancel_outgoing(stream: &mut TcpStream, cipher: &ChaCha20Poly1305) {
+    let _ = write_encrypted(
+        stream,
+        cipher,
+        &WireMessage::Control(ControlMessage::Decline),
+        "cancel outgoing transfer",
+    );
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 fn requires_pairing(trust: &TrustStore, remote: &Hello) -> bool {
@@ -633,7 +662,9 @@ fn map_io_error(context: &str, err: std::io::Error) -> anyhow::Error {
 
     match err.kind() {
         ErrorKind::UnexpectedEof => {
-            anyhow!("{context}: peer closed the connection before the transfer finished")
+            anyhow!(
+                "{context}: connection closed early — the other device may have cancelled, quit, or lost network"
+            )
         }
         ErrorKind::TimedOut => anyhow!("{context}: timed out — is the other device still running?"),
         ErrorKind::WouldBlock | ErrorKind::Interrupted => {
@@ -925,5 +956,73 @@ mod tests {
         let result = receiver_handle.join().unwrap();
         let saved = std::fs::read(&result.saved_paths[0]).unwrap();
         assert_eq!(saved, payload);
+    }
+
+    #[test]
+    fn read_encrypted_reports_early_close_on_offer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_, cipher_b) = paired_ciphers();
+
+        let reader = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            configure_stream(&stream).unwrap();
+            read_encrypted(&mut stream, &cipher_b, "read file offer")
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        drop(stream);
+
+        let err = reader.join().unwrap().unwrap_err().to_string();
+        assert!(err.contains("read file offer"), "unexpected error: {err}");
+        assert!(
+            err.contains("connection closed early"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn e2e_sender_cancels_after_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let sender = test_identity("sender");
+        let receiver = test_identity("receiver");
+        let (sender_trust, mut receiver_trust) = trusted_pair(&sender, &receiver);
+        let receiver_device_id = receiver.device_id.clone();
+
+        let receiver_handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let incoming = begin_incoming(&receiver, &receiver_trust, stream).unwrap();
+            incoming.accept_and_save(&mut receiver_trust, |_p, _m| {})
+        });
+
+        let sender_handle = thread::spawn(move || {
+            let (mut stream, handshake) =
+                connect_and_handshake(&sender, &sender_trust, addr, &receiver_device_id).unwrap();
+            match read_encrypted(
+                &mut stream,
+                &handshake.cipher,
+                "waiting for receiver to accept connection",
+            ) {
+                Ok(WireMessage::Control(ControlMessage::Accept)) => {
+                    cancel_outgoing(&mut stream, &handshake.cipher);
+                    Ok(())
+                }
+                other => Err(anyhow!("unexpected message while waiting for acceptance: {other:?}")),
+            }
+        });
+
+        let receiver_result = receiver_handle.join().unwrap();
+        sender_handle.join().unwrap().unwrap();
+
+        let msg = match receiver_result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected receive failure"),
+        };
+        assert!(
+            msg.contains("sender cancelled before sending files"),
+            "unexpected error: {msg}"
+        );
     }
 }

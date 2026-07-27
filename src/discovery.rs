@@ -119,6 +119,21 @@ impl Discovery {
         self.reregister(&current)
     }
 
+    pub fn rescan(&mut self) -> Result<()> {
+        {
+            let mut registry = self.registry.lock().expect("peer registry lock");
+            registry.clear();
+        }
+        self.last_addrs = local_ipv4_addrs();
+        self.network_change_at = None;
+        self.session_epoch = rand::thread_rng().gen();
+        self.reregister(&self.last_addrs.clone())?;
+        while let Ok(event) = self.browse_rx.recv_timeout(Duration::from_millis(50)) {
+            self.handle_event(event);
+        }
+        Ok(())
+    }
+
     fn reregister(&mut self, addrs: &[IpAddr]) -> Result<()> {
         self.daemon.unregister(&self.service_name).ok();
         let info = build_service_info(
@@ -327,5 +342,45 @@ mod tests {
         let mut b = a.clone();
         b.sort();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rescan_clears_registry_and_bumps_epoch() {
+        let (_, port) = pick_listen_port().expect("pick port");
+        let mut discovery =
+            Discovery::start("test-rescan-device", "RescanTest", port).expect("start discovery");
+        let epoch_before = discovery.session_epoch();
+
+        {
+            let registry = discovery.registry();
+            let mut reg = registry.lock().unwrap();
+            let now = Instant::now();
+            reg.upsert(
+                PeerUpsert {
+                    device_id: "peer-1".into(),
+                    name: "Peer".into(),
+                    addr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+                    port: 9000,
+                    mdns_fullname: "peer.local".into(),
+                    session_epoch: 1,
+                },
+                now,
+            );
+            assert_eq!(reg.len(), 1);
+        }
+
+        discovery.rescan().expect("rescan");
+
+        assert_ne!(discovery.session_epoch(), epoch_before);
+        let peers = discovery
+            .registry()
+            .lock()
+            .unwrap()
+            .visible_peers(Instant::now(), "test-rescan-device");
+        assert!(
+            !peers.iter().any(|p| p.device_id == "peer-1"),
+            "rescan should clear manually inserted peer; remaining: {:?}",
+            peers.iter().map(|p| &p.device_id).collect::<Vec<_>>()
+        );
     }
 }

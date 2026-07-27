@@ -2,12 +2,13 @@ use crate::config::{Identity, TrustStore};
 use crate::discovery::{Discovery, pick_listen_port};
 use crate::peer_registry::{PeerPresence, PeerSnapshot};
 use crate::transfer::{
-    connect_and_handshake, dispatch_incoming, send_files_on_connection, send_pairing_message,
+    cancel_outgoing, connect_and_handshake, dispatch_incoming, send_files_on_connection,
     HandshakeResult, IncomingDispatch, IncomingTransfer,
 };
 use anyhow::{Context, Result};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -46,6 +47,9 @@ pub enum RuntimeEvent {
         fraction: f32,
         label: String,
     },
+    TransferCancelled {
+        message: String,
+    },
     Log(String),
 }
 
@@ -56,6 +60,8 @@ pub enum RuntimeCommand {
     },
     ConfirmSendPairing,
     CancelSendPairing,
+    CancelTransfer,
+    RescanNetwork,
     AcceptIncoming(IncomingTransfer),
     DeclineIncoming(IncomingTransfer),
 }
@@ -85,6 +91,14 @@ impl RuntimeHandle {
         let _ = self.cmd_tx.send(RuntimeCommand::CancelSendPairing);
     }
 
+    pub fn cancel_transfer(&self) {
+        let _ = self.cmd_tx.send(RuntimeCommand::CancelTransfer);
+    }
+
+    pub fn rescan_network(&self) {
+        let _ = self.cmd_tx.send(RuntimeCommand::RescanNetwork);
+    }
+
     pub fn accept(&self, transfer: IncomingTransfer) {
         let _ = self
             .cmd_tx
@@ -105,14 +119,16 @@ pub fn spawn(identity: Identity, trust: TrustStore) -> Result<RuntimeHandle> {
     let identity = Arc::new(identity);
     let trust = Arc::new(Mutex::new(trust));
     let pending_send = Arc::new(Mutex::new(None::<PendingSend>));
+    let rescan_requested = Arc::new(AtomicBool::new(false));
+    let active_stream = Arc::new(Mutex::new(None::<TcpStream>));
 
     let (listener, port) = pick_listen_port()?;
     listener.set_nonblocking(true)?;
 
     let id_bg = Arc::clone(&identity);
-    let trust_bg = Arc::clone(&trust);
+    let rescan_bg = Arc::clone(&rescan_requested);
     let event_peers = event_tx.clone();
-    thread::spawn(move || peer_loop(id_bg, trust_bg, port, event_peers));
+    thread::spawn(move || peer_loop(id_bg, port, event_peers, rescan_bg));
 
     let id_listener = Arc::clone(&identity);
     let trust_listener = Arc::clone(&trust);
@@ -122,7 +138,19 @@ pub fn spawn(identity: Identity, trust: TrustStore) -> Result<RuntimeHandle> {
     let id_cmd = Arc::clone(&identity);
     let trust_cmd = Arc::clone(&trust);
     let pending_cmd = Arc::clone(&pending_send);
-    thread::spawn(move || command_loop(id_cmd, trust_cmd, pending_cmd, cmd_rx, event_tx));
+    let active_cmd = Arc::clone(&active_stream);
+    let rescan_cmd = Arc::clone(&rescan_requested);
+    thread::spawn(move || {
+        command_loop(
+            id_cmd,
+            trust_cmd,
+            pending_cmd,
+            active_cmd,
+            rescan_cmd,
+            cmd_rx,
+            event_tx,
+        )
+    });
 
     Ok(RuntimeHandle {
         events: event_rx,
@@ -132,9 +160,9 @@ pub fn spawn(identity: Identity, trust: TrustStore) -> Result<RuntimeHandle> {
 
 fn peer_loop(
     identity: Arc<Identity>,
-    _trust: Arc<Mutex<TrustStore>>,
     port: u16,
     event_tx: Sender<RuntimeEvent>,
+    rescan_requested: Arc<AtomicBool>,
 ) {
     let mut discovery = match Discovery::start(&identity.device_id, &identity.name, port) {
         Ok(d) => d,
@@ -146,6 +174,21 @@ fn peer_loop(
     let mut last: Vec<Peer> = Vec::new();
     loop {
         thread::sleep(Duration::from_secs(2));
+
+        if rescan_requested.swap(false, Ordering::SeqCst) {
+            match discovery.rescan() {
+                Ok(()) => {
+                    last.clear();
+                    let _ = event_tx.send(RuntimeEvent::Log(
+                        "Network rescan started — searching for devices…".to_string(),
+                    ));
+                }
+                Err(err) => {
+                    let _ = event_tx.send(RuntimeEvent::Log(format!("Rescan failed: {err}")));
+                }
+            }
+        }
+
         match discovery.poll_peers(&identity.device_id) {
             Ok(peers) => {
                 let mapped = peers
@@ -161,6 +204,22 @@ fn peer_loop(
                 let _ = event_tx.send(RuntimeEvent::Log(format!("browse error: {err}")));
             }
         }
+    }
+}
+
+fn register_active(active: &Arc<Mutex<Option<TcpStream>>>, stream: &TcpStream) {
+    if let Ok(clone) = stream.try_clone() {
+        *active.lock().expect("active stream lock") = Some(clone);
+    }
+}
+
+fn clear_active(active: &Arc<Mutex<Option<TcpStream>>>) {
+    *active.lock().expect("active stream lock") = None;
+}
+
+fn abort_active(active: &Arc<Mutex<Option<TcpStream>>>) {
+    if let Some(stream) = active.lock().expect("active stream lock").take() {
+        let _ = stream.shutdown(Shutdown::Both);
     }
 }
 
@@ -223,6 +282,8 @@ fn command_loop(
     identity: Arc<Identity>,
     trust: Arc<Mutex<TrustStore>>,
     pending_send: Arc<Mutex<Option<PendingSend>>>,
+    active_stream: Arc<Mutex<Option<TcpStream>>>,
+    rescan_requested: Arc<AtomicBool>,
     cmd_rx: Receiver<RuntimeCommand>,
     event_tx: Sender<RuntimeEvent>,
 ) {
@@ -231,115 +292,157 @@ fn command_loop(
             RuntimeCommand::Send { peer, paths } => {
                 let event_tx = event_tx.clone();
                 let pending_send = Arc::clone(&pending_send);
+                let active_stream = Arc::clone(&active_stream);
                 let identity = Arc::clone(&identity);
-                let mut trust = trust.lock().expect("trust lock");
-                let progress = |fraction: f32, label: &str| {
-                    let _ = event_tx.send(RuntimeEvent::TransferProgress {
-                        fraction,
-                        label: label.to_string(),
-                    });
-                };
-                progress(0.02, "Connecting…");
-                match connect_and_handshake(&identity, &trust, peer.addr, &peer.device_id) {
-                    Ok((mut stream, handshake)) => {
-                        progress(0.05, "Handshaking…");
-                        if handshake.needs_pairing_confirm {
-                            let pairing_code = handshake.pairing_code.clone();
-                            *pending_send.lock().expect("pending send lock") = Some(PendingSend {
-                                peer: peer.clone(),
-                                paths,
-                                stream,
-                                handshake,
-                            });
-                            let _ = event_tx.send(RuntimeEvent::SendPairingConfirm {
-                                peer_name: peer.name,
-                                pairing_code,
-                            });
-                        } else {
-                            let remote_id = handshake.remote.device_id.clone();
-                            let remote_pk = handshake.remote.public_key.clone();
-                            let result = finish_send(
-                                &mut stream,
-                                &handshake,
-                                &paths,
-                                &peer.name,
-                                progress,
-                            );
-                            if result.is_ok() {
-                                trust.trust_peer(&remote_id, &remote_pk);
-                                let _ = trust.save();
+                let trust = Arc::clone(&trust);
+                thread::spawn(move || {
+                    let progress = |fraction: f32, label: &str| {
+                        let _ = event_tx.send(RuntimeEvent::TransferProgress {
+                            fraction,
+                            label: label.to_string(),
+                        });
+                    };
+                    progress(0.02, "Connecting…");
+                    let mut trust = trust.lock().expect("trust lock");
+                    match connect_and_handshake(&identity, &trust, peer.addr, &peer.device_id) {
+                        Ok((stream, handshake)) => {
+                            register_active(&active_stream, &stream);
+                            progress(0.05, "Handshaking…");
+                            if handshake.needs_pairing_confirm {
+                                let pairing_code = handshake.pairing_code.clone();
+                                let mut stream = stream;
+                                *pending_send.lock().expect("pending send lock") =
+                                    Some(PendingSend {
+                                        peer: peer.clone(),
+                                        paths,
+                                        stream,
+                                        handshake,
+                                    });
+                                clear_active(&active_stream);
+                                let _ = event_tx.send(RuntimeEvent::SendPairingConfirm {
+                                    peer_name: peer.name,
+                                    pairing_code,
+                                });
+                            } else {
+                                let mut stream = stream;
+                                let remote_id = handshake.remote.device_id.clone();
+                                let remote_pk = handshake.remote.public_key.clone();
+                                let result = finish_send(
+                                    &mut stream,
+                                    &handshake,
+                                    &paths,
+                                    &peer.name,
+                                    progress,
+                                );
+                                clear_active(&active_stream);
+                                if result.is_ok() {
+                                    trust.trust_peer(&remote_id, &remote_pk);
+                                    let _ = trust.save();
+                                }
+                                emit_send_finished(&event_tx, &peer.name, result);
                             }
-                            emit_send_finished(&event_tx, &peer.name, result);
+                        }
+                        Err(err) => {
+                            clear_active(&active_stream);
+                            let _ = event_tx.send(RuntimeEvent::SendFinished {
+                                ok: false,
+                                message: format!("Send failed: {err}"),
+                            });
                         }
                     }
-                    Err(err) => {
-                        let _ = event_tx.send(RuntimeEvent::SendFinished {
-                            ok: false,
-                            message: format!("Send failed: {err}"),
-                        });
-                    }
-                }
+                });
             }
             RuntimeCommand::ConfirmSendPairing => {
                 let event_tx = event_tx.clone();
+                let active_stream = Arc::clone(&active_stream);
                 let mut pending = pending_send.lock().expect("pending send lock");
                 let Some(mut pending_send) = pending.take() else {
                     continue;
                 };
+                register_active(&active_stream, &pending_send.stream);
                 let peer_name = pending_send.peer.name.clone();
                 let remote_id = pending_send.handshake.remote.device_id.clone();
                 let remote_pk = pending_send.handshake.remote.public_key.clone();
-                let progress = |fraction: f32, label: &str| {
-                    let _ = event_tx.send(RuntimeEvent::TransferProgress {
-                        fraction,
-                        label: label.to_string(),
-                    });
-                };
-                let result = finish_send(
-                    &mut pending_send.stream,
-                    &pending_send.handshake,
-                    &pending_send.paths,
-                    &peer_name,
-                    progress,
-                );
-                if result.is_ok() {
+                let identity = Arc::clone(&identity);
+                let trust = Arc::clone(&trust);
+                thread::spawn(move || {
+                    let progress = |fraction: f32, label: &str| {
+                        let _ = event_tx.send(RuntimeEvent::TransferProgress {
+                            fraction,
+                            label: label.to_string(),
+                        });
+                    };
                     let mut trust = trust.lock().expect("trust lock");
-                    trust.trust_peer(&remote_id, &remote_pk);
-                    let _ = trust.save();
-                }
-                emit_send_finished(&event_tx, &peer_name, result);
+                    let result = finish_send(
+                        &mut pending_send.stream,
+                        &pending_send.handshake,
+                        &pending_send.paths,
+                        &peer_name,
+                        progress,
+                    );
+                    clear_active(&active_stream);
+                    if result.is_ok() {
+                        trust.trust_peer(&remote_id, &remote_pk);
+                        let _ = trust.save();
+                    }
+                    emit_send_finished(&event_tx, &peer_name, result);
+                    let _ = identity;
+                });
             }
             RuntimeCommand::CancelSendPairing => {
-                *pending_send.lock().expect("pending send lock") = None;
+                if let Some(mut pending) = pending_send.lock().expect("pending send lock").take()
+                {
+                    cancel_outgoing(&mut pending.stream, &pending.handshake.cipher);
+                }
+                abort_active(&active_stream);
                 let _ = event_tx.send(RuntimeEvent::SendFinished {
                     ok: false,
                     message: "Send cancelled — pairing not confirmed".to_string(),
                 });
             }
-            RuntimeCommand::AcceptIncoming(transfer) => {
-                let mut trust = trust.lock().expect("trust lock");
-                let event_tx = event_tx.clone();
-                let result = transfer.accept_and_save(&mut trust, |fraction, label| {
-                    let _ = event_tx.send(RuntimeEvent::TransferProgress {
-                        fraction,
-                        label: label.to_string(),
-                    });
+            RuntimeCommand::CancelTransfer => {
+                if let Some(mut pending) = pending_send.lock().expect("pending send lock").take()
+                {
+                    cancel_outgoing(&mut pending.stream, &pending.handshake.cipher);
+                }
+                abort_active(&active_stream);
+                let _ = event_tx.send(RuntimeEvent::TransferCancelled {
+                    message: "Transfer cancelled".to_string(),
                 });
-                let msg = match &result {
-                    Ok(r) => format!(
-                        "Received {} file(s): {}",
-                        r.saved_paths.len(),
-                        r.files
-                            .iter()
-                            .map(|f| f.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    Err(e) => format!("Receive failed: {e}"),
-                };
-                let _ = event_tx.send(RuntimeEvent::ReceiveFinished {
-                    ok: result.is_ok(),
-                    message: msg,
+            }
+            RuntimeCommand::RescanNetwork => {
+                rescan_requested.store(true, Ordering::SeqCst);
+            }
+            RuntimeCommand::AcceptIncoming(transfer) => {
+                let event_tx = event_tx.clone();
+                let active_stream = Arc::clone(&active_stream);
+                let trust = Arc::clone(&trust);
+                transfer.track_for_cancel(&active_stream);
+                thread::spawn(move || {
+                    let mut trust = trust.lock().expect("trust lock");
+                    let result = transfer.accept_and_save(&mut trust, |fraction, label| {
+                        let _ = event_tx.send(RuntimeEvent::TransferProgress {
+                            fraction,
+                            label: label.to_string(),
+                        });
+                    });
+                    clear_active(&active_stream);
+                    let msg = match &result {
+                        Ok(r) => format!(
+                            "Received {} file(s): {}",
+                            r.saved_paths.len(),
+                            r.files
+                                .iter()
+                                .map(|f| f.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        Err(e) => format!("Receive failed: {e}"),
+                    };
+                    let _ = event_tx.send(RuntimeEvent::ReceiveFinished {
+                        ok: result.is_ok(),
+                        message: msg,
+                    });
                 });
             }
             RuntimeCommand::DeclineIncoming(transfer) => {
@@ -363,14 +466,17 @@ fn finish_send<F>(
 where
     F: FnMut(f32, &str),
 {
-    if handshake.needs_pairing_confirm {
-        send_pairing_message(stream, &handshake.cipher, &handshake.pairing_code)?;
-    }
+    let pairing_code = if handshake.needs_pairing_confirm {
+        Some(handshake.pairing_code.as_str())
+    } else {
+        None
+    };
     send_files_on_connection(
         stream,
         &handshake.remote,
         &handshake.cipher,
         paths,
+        pairing_code,
         |fraction, label| on_progress(fraction, label),
     )
     .with_context(|| format!("send to {peer_name}"))
