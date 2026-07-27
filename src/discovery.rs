@@ -1,12 +1,17 @@
 use crate::peer_registry::{PeerRegistry, PeerSnapshot, PeerUpsert};
+use crate::probe;
 use crate::protocol::SERVICE_TYPE;
 use anyhow::{Context, Result};
 use if_addrs::IfAddr;
 use mdns_sd::{Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
+use rand::Rng;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Debounce window before flushing peers after a network interface change.
+const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DiscoveredPeer {
@@ -21,27 +26,28 @@ pub struct Discovery {
     service_name: String,
     browse_rx: Receiver<ServiceEvent>,
     registry: Arc<Mutex<PeerRegistry>>,
+    device_id: String,
+    display_name: String,
+    port: u16,
+    session_epoch: u64,
+    last_addrs: Vec<IpAddr>,
+    network_change_at: Option<Instant>,
 }
 
 impl Discovery {
     pub fn start(device_id: &str, name: &str, port: u16) -> Result<Self> {
+        let session_epoch = rand::thread_rng().gen::<u64>();
         let daemon = ServiceDaemon::new().context("start mDNS daemon")?;
-        let host = format!("{}.local.", sanitize(device_id));
         let service_name = format!("NewTowerRelay-{}", &device_id[..device_id.len().min(8)]);
-        let properties = HashMap::from([
-            ("device_id".to_string(), device_id.to_string()),
-            ("name".to_string(), name.to_string()),
-        ]);
-        let my_addrs = local_ipv4_addrs();
-        let info = ServiceInfo::new(
-            SERVICE_TYPE,
-            &service_name,
-            &host,
-            my_addrs.as_slice(),
+        let last_addrs = local_ipv4_addrs();
+        let info = build_service_info(
+            device_id,
+            name,
             port,
-            Some(properties),
-        )
-        .context("build service info")?;
+            session_epoch,
+            last_addrs.as_slice(),
+            &service_name,
+        )?;
         daemon.register(info).context("register mDNS service")?;
         let browse_rx = daemon.browse(SERVICE_TYPE).context("browse mDNS")?;
         Ok(Self {
@@ -49,6 +55,12 @@ impl Discovery {
             service_name,
             browse_rx,
             registry: Arc::new(Mutex::new(PeerRegistry::new())),
+            device_id: device_id.to_string(),
+            display_name: name.to_string(),
+            port,
+            session_epoch,
+            last_addrs,
+            network_change_at: None,
         })
     }
 
@@ -58,16 +70,79 @@ impl Discovery {
         Arc::clone(&self.registry)
     }
 
-    /// Drain mDNS events and return the current visible peer list.
-    pub fn poll_peers(&self, own_device_id: &str) -> Result<Vec<PeerSnapshot>> {
+    #[cfg(test)]
+    pub fn session_epoch(&self) -> u64 {
+        self.session_epoch
+    }
+
+    /// Drain mDNS events, run probes, and return the current visible peer list.
+    pub fn poll_peers(&mut self, own_device_id: &str) -> Result<Vec<PeerSnapshot>> {
+        self.handle_network_change()?;
+
         while let Ok(event) = self.browse_rx.recv_timeout(Duration::from_millis(50)) {
             self.handle_event(event);
         }
 
         let now = Instant::now();
+        self.run_probes(own_device_id, now);
+
         let mut registry = self.registry.lock().expect("peer registry lock");
         registry.evict_expired(now);
         Ok(registry.visible_peers(now, own_device_id))
+    }
+
+    fn handle_network_change(&mut self) -> Result<()> {
+        let current = local_ipv4_addrs();
+        if current == self.last_addrs {
+            self.network_change_at = None;
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if self.network_change_at.is_none() {
+            self.network_change_at = Some(now);
+            return Ok(());
+        }
+
+        if now.duration_since(self.network_change_at.unwrap()) < NETWORK_CHANGE_DEBOUNCE {
+            return Ok(());
+        }
+
+        self.last_addrs = current.clone();
+        self.network_change_at = None;
+
+        {
+            let mut registry = self.registry.lock().expect("peer registry lock");
+            registry.clear();
+        }
+
+        self.reregister(&current)
+    }
+
+    fn reregister(&mut self, addrs: &[IpAddr]) -> Result<()> {
+        self.daemon.unregister(&self.service_name).ok();
+        let info = build_service_info(
+            &self.device_id,
+            &self.display_name,
+            self.port,
+            self.session_epoch,
+            addrs,
+            &self.service_name,
+        )?;
+        self.daemon.register(info).context("re-register mDNS service")?;
+        Ok(())
+    }
+
+    fn run_probes(&self, own_device_id: &str, now: Instant) {
+        let targets = {
+            let registry = self.registry.lock().expect("peer registry lock");
+            registry.peers_for_probe(now, own_device_id)
+        };
+        for (device_id, addr) in targets {
+            let ok = probe::probe_peer(addr, own_device_id);
+            let mut registry = self.registry.lock().expect("peer registry lock");
+            registry.record_probe_result(&device_id, ok, now);
+        }
     }
 
     fn handle_event(&self, event: ServiceEvent) {
@@ -85,6 +160,10 @@ impl Discovery {
                         .get_property("name")
                         .map(|v| v.val_str().to_string())
                         .unwrap_or_else(|| fullname.clone());
+                    let session_epoch = info
+                        .get_property("session_epoch")
+                        .and_then(|v| v.val_str().parse().ok())
+                        .unwrap_or(0);
                     registry.upsert(
                         PeerUpsert {
                             device_id,
@@ -92,6 +171,7 @@ impl Discovery {
                             addr,
                             port,
                             mdns_fullname: fullname,
+                            session_epoch,
                         },
                         now,
                     );
@@ -110,6 +190,31 @@ impl Discovery {
     }
 }
 
+fn build_service_info(
+    device_id: &str,
+    name: &str,
+    port: u16,
+    session_epoch: u64,
+    addrs: &[IpAddr],
+    service_name: &str,
+) -> Result<ServiceInfo> {
+    let host = format!("{}.local.", sanitize(device_id));
+    let properties = HashMap::from([
+        ("device_id".to_string(), device_id.to_string()),
+        ("name".to_string(), name.to_string()),
+        ("session_epoch".to_string(), session_epoch.to_string()),
+    ]);
+    ServiceInfo::new(
+        SERVICE_TYPE,
+        service_name,
+        &host,
+        addrs,
+        port,
+        Some(properties),
+    )
+    .context("build service info")
+}
+
 pub fn pick_listen_port() -> Result<(TcpListener, u16)> {
     let listener = TcpListener::bind(("0.0.0.0", 0)).context("bind tcp")?;
     let port = listener.local_addr()?.port();
@@ -124,7 +229,7 @@ fn pick_addr(info: &ServiceInfo) -> Option<(IpAddr, u16)> {
         .map(|ip| (*ip, port))
 }
 
-fn local_ipv4_addrs() -> Vec<IpAddr> {
+pub fn local_ipv4_addrs() -> Vec<IpAddr> {
     let mut addrs = Vec::new();
     if let Ok(interfaces) = if_addrs::get_if_addrs() {
         for iface in interfaces {
@@ -136,6 +241,7 @@ fn local_ipv4_addrs() -> Vec<IpAddr> {
             }
         }
     }
+    addrs.sort();
     if addrs.is_empty() {
         addrs.push(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
     }
@@ -167,6 +273,7 @@ mod tests {
                     addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
                     port: 8000,
                     mdns_fullname: "old-instance.local".into(),
+                    session_epoch: 1,
                 },
                 now,
             );
@@ -177,6 +284,7 @@ mod tests {
                     addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
                     port: 8001,
                     mdns_fullname: "new-instance.local".into(),
+                    session_epoch: 2,
                 },
                 now,
             );
@@ -200,12 +308,24 @@ mod tests {
                     addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
                     port: 8000,
                     mdns_fullname: "laptop.local".into(),
+                    session_epoch: 1,
                 },
                 now,
             );
-            assert_eq!(reg.remove_by_fullname("laptop.local"), Some("dev-1".into()));
+            assert_eq!(
+                reg.remove_by_fullname("laptop.local"),
+                Some("dev-1".into())
+            );
         }
         let reg = registry.lock().unwrap();
         assert!(reg.visible_peers(now, "self").is_empty());
+    }
+
+    #[test]
+    fn local_addrs_are_sorted_for_stable_comparison() {
+        let a = local_ipv4_addrs();
+        let mut b = a.clone();
+        b.sort();
+        assert_eq!(a, b);
     }
 }

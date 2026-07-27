@@ -3,6 +3,7 @@ mod config;
 mod crypto;
 mod discovery;
 mod peer_registry;
+mod probe;
 mod protocol;
 mod runtime;
 mod transfer;

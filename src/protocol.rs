@@ -52,6 +52,9 @@ pub struct Offer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMessage {
     Hello(Hello),
+    /// Lightweight liveness check (plaintext, no handshake).
+    Ping { device_id: String },
+    Pong,
     Pairing(PairingRequest),
     Offer(Offer),
     Accept,
@@ -127,5 +130,25 @@ mod tests {
             }
             other => panic!("expected FileStart, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ping_pong_control_roundtrip() {
+        let ping = WireMessage::Control(ControlMessage::Ping {
+            device_id: "dev-1".into(),
+        });
+        let frame = ping.encode().unwrap();
+        let decoded = WireMessage::decode_frame(frame[..4].try_into().unwrap(), &frame[4..]).unwrap();
+        match decoded {
+            WireMessage::Control(ControlMessage::Ping { device_id }) => {
+                assert_eq!(device_id, "dev-1");
+            }
+            other => panic!("expected Ping, got {other:?}"),
+        }
+
+        let pong = WireMessage::Control(ControlMessage::Pong);
+        let frame = pong.encode().unwrap();
+        let decoded = WireMessage::decode_frame(frame[..4].try_into().unwrap(), &frame[4..]).unwrap();
+        assert!(matches!(decoded, WireMessage::Control(ControlMessage::Pong)));
     }
 }

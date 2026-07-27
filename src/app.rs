@@ -9,15 +9,20 @@ use std::path::{Path, PathBuf};
 
 const BTN_BLUE: egui::Color32 = egui::Color32::from_rgb(37, 99, 235);
 const BTN_BLUE_DARK: egui::Color32 = egui::Color32::from_rgb(29, 78, 216);
+const BTN_BLUE_HOVER: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);
 const BTN_BLUE_DISABLED: egui::Color32 = egui::Color32::from_rgb(147, 170, 220);
 const BTN_STROKE: egui::Color32 = egui::Color32::from_rgb(30, 64, 175);
 const BTN_GREEN: egui::Color32 = egui::Color32::from_rgb(34, 197, 94);
+const BTN_GREEN_HOVER: egui::Color32 = egui::Color32::from_rgb(52, 211, 122);
 const BTN_GREEN_DISABLED: egui::Color32 = egui::Color32::from_rgb(134, 200, 160);
 const BTN_GREEN_STROKE: egui::Color32 = egui::Color32::from_rgb(21, 128, 61);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(22, 163, 74);
 const RED: egui::Color32 = egui::Color32::from_rgb(220, 38, 38);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(180, 120, 0);
 const INTER_SEMIBOLD: &str = "inter-semibold";
+const BTN_RADIUS: f32 = 12.0;
+const WINDOW_RADIUS: f32 = 18.0;
+const CARD_RADIUS: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StatusKind {
@@ -193,13 +198,13 @@ impl RelayApp {
         let dark = ui.visuals().dark_mode;
         let (fill, stroke, text) = if dark {
             (
-                egui::Color32::from_rgb(60, 24, 24),
+                egui::Color32::from_rgba_unmultiplied(80, 28, 28, 220),
                 RED,
                 egui::Color32::from_rgb(254, 202, 202),
             )
         } else {
             (
-                egui::Color32::from_rgb(254, 226, 226),
+                egui::Color32::from_rgba_unmultiplied(254, 226, 226, 230),
                 egui::Color32::from_rgb(185, 28, 28),
                 egui::Color32::from_rgb(127, 29, 29),
             )
@@ -208,7 +213,7 @@ impl RelayApp {
             .fill(fill)
             .stroke(egui::Stroke::new(1.5_f32, stroke))
             .inner_margin(egui::Margin::symmetric(12, 8))
-            .corner_radius(6.0)
+            .corner_radius(CARD_RADIUS)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("⚠").size(18.0).color(stroke));
@@ -230,7 +235,8 @@ impl RelayApp {
                 egui::ProgressBar::new(fraction)
                     .fill(BTN_GREEN)
                     .animate(true)
-                    .text(label),
+                    .text(label)
+                    .corner_radius(CARD_RADIUS),
             );
             ui.add_space(6.0);
         }
@@ -434,16 +440,12 @@ impl RelayApp {
 
         if let Some(pending) = self.pending_send_pairing.clone() {
             ui.add_space(4.0);
-            let frame_fill = if ui.visuals().dark_mode {
-                egui::Color32::from_rgb(35, 38, 48)
-            } else {
-                egui::Color32::from_rgb(255, 251, 235)
-            };
+            let frame_fill = card_fill(ui.visuals().dark_mode);
             egui::Frame::new()
                 .fill(frame_fill)
                 .stroke(egui::Stroke::new(1.0_f32, AMBER))
                 .inner_margin(10.0)
-                .corner_radius(6.0)
+                .corner_radius(CARD_RADIUS)
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(format!(
@@ -493,7 +495,7 @@ impl RelayApp {
             ui,
             "Send encrypted",
             can_send && !sending,
-            egui::vec2(ui.available_width(), 42.0),
+            egui::vec2(ui.available_width(), 46.0),
             15.0,
         )
         .clicked()
@@ -530,16 +532,12 @@ impl RelayApp {
 
             if pending.needs_pairing {
                 ui.add_space(6.0);
-                let frame_fill = if ui.visuals().dark_mode {
-                    egui::Color32::from_rgb(35, 38, 48)
-                } else {
-                    egui::Color32::from_rgb(255, 251, 235)
-                };
+                let frame_fill = card_fill(ui.visuals().dark_mode);
                 egui::Frame::new()
                     .fill(frame_fill)
                     .stroke(egui::Stroke::new(1.0_f32, AMBER))
                     .inner_margin(10.0)
-                    .corner_radius(6.0)
+                    .corner_radius(CARD_RADIUS)
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new("Pairing code — verify on both devices:")
@@ -621,6 +619,10 @@ impl RelayApp {
 }
 
 impl eframe::App for RelayApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let theme = ctx.theme();
         if theme != self.last_theme {
@@ -631,7 +633,10 @@ impl eframe::App for RelayApp {
         self.poll_events();
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let dark = ctx.style().visuals.dark_mode;
+        egui::CentralPanel::default()
+            .frame(app_shell_frame(dark))
+            .show(ctx, |ui| {
             ui.add_space(8.0);
             self.draw_error_banner(ui);
             self.draw_header(ui);
@@ -657,6 +662,8 @@ fn peer_row_label(peer: &Peer, dismissed_new: &HashSet<String>) -> String {
         "  NEW"
     } else if peer.presence == PeerPresence::Stale {
         "  away"
+    } else if !peer.reachable {
+        "  …"
     } else {
         ""
     };
@@ -677,6 +684,7 @@ mod peer_label_tests {
             addr: SocketAddr::from(([192, 168, 1, 2], 9000)),
             presence,
             is_new,
+            reachable: presence == PeerPresence::Online,
         }
     }
 
@@ -825,30 +833,14 @@ fn blue_button(
     min_size: egui::Vec2,
     font_size: f32,
 ) -> egui::Response {
-    let fill = if !enabled {
-        BTN_BLUE_DISABLED
-    } else if emphasized {
-        BTN_BLUE_DARK
-    } else {
-        BTN_BLUE
-    };
-    let text_color = egui::Color32::WHITE;
-    let width = if min_size.x > 0.0 {
-        min_size.x
-    } else {
-        ui.available_width().max(100.0) / 2.0 - 4.0
-    };
-    ui.add_enabled(
+    pill_button(
+        ui,
+        label,
         enabled,
-        egui::Button::new(
-            egui::RichText::new(label)
-                .font(inter_semibold(font_size))
-                .color(text_color),
-        )
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.5_f32, BTN_STROKE))
-            .corner_radius(6.0)
-            .min_size(egui::vec2(width, min_size.y)),
+        ButtonKind::Blue,
+        emphasized,
+        min_size,
+        font_size,
     )
 }
 
@@ -859,19 +851,185 @@ fn green_button(
     min_size: egui::Vec2,
     font_size: f32,
 ) -> egui::Response {
-    let fill = if enabled { BTN_GREEN } else { BTN_GREEN_DISABLED };
-    ui.add_enabled(
+    pill_button(
+        ui,
+        label,
         enabled,
-        egui::Button::new(
-            egui::RichText::new(label)
-                .font(inter_semibold(font_size))
-                .color(egui::Color32::WHITE),
-        )
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.5_f32, BTN_GREEN_STROKE))
-            .corner_radius(6.0)
-            .min_size(min_size),
+        ButtonKind::Green,
+        true,
+        min_size,
+        font_size,
     )
+}
+
+#[derive(Clone, Copy)]
+enum ButtonKind {
+    Blue,
+    Green,
+}
+
+fn pill_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    enabled: bool,
+    kind: ButtonKind,
+    emphasized: bool,
+    min_size: egui::Vec2,
+    font_size: f32,
+) -> egui::Response {
+    let width = if min_size.x > 0.0 {
+        min_size.x
+    } else {
+        ui.available_width().max(100.0) / 2.0 - 4.0
+    };
+    let height = min_size.y.max(44.0);
+    let size = egui::vec2(width, height);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_at_least(size, sense);
+
+    if ui.is_rect_visible(rect) {
+        let hovered = enabled && response.hovered();
+        let pressed = enabled && response.is_pointer_button_down_on();
+        let (fill, stroke, stroke_w) = button_style(kind, enabled, emphasized, hovered, pressed);
+
+        if enabled {
+            let shadow = rect.translate(egui::vec2(0.0, 4.0));
+            ui.painter().rect_filled(
+                shadow,
+                BTN_RADIUS + 2.0,
+                egui::Color32::from_black_alpha(if pressed { 25 } else if hovered { 55 } else { 40 }),
+            );
+        }
+
+        ui.painter()
+            .rect_filled(rect, BTN_RADIUS, fill);
+        ui.painter().rect_stroke(
+            rect,
+            BTN_RADIUS,
+            egui::Stroke::new(stroke_w, stroke),
+            egui::StrokeKind::Inside,
+        );
+
+        if enabled && !pressed {
+            let shine = egui::Rect::from_min_max(
+                rect.min + egui::vec2(3.0, 2.0),
+                rect.min + egui::vec2(rect.width() - 3.0, rect.height() * 0.45),
+            );
+            ui.painter().rect_filled(
+                shine,
+                BTN_RADIUS,
+                egui::Color32::from_white_alpha(if hovered { 36 } else { 22 }),
+            );
+        }
+
+        if emphasized && enabled {
+            ui.painter().rect_stroke(
+                rect.expand(1.5),
+                BTN_RADIUS + 1.5,
+                egui::Stroke::new(
+                    1.5,
+                    egui::Color32::from_white_alpha(if hovered { 90 } else { 55 }),
+                ),
+                egui::StrokeKind::Outside,
+            );
+        }
+
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            inter_semibold(font_size),
+            egui::Color32::WHITE,
+        );
+    }
+
+    response
+}
+
+fn button_style(
+    kind: ButtonKind,
+    enabled: bool,
+    emphasized: bool,
+    hovered: bool,
+    pressed: bool,
+) -> (egui::Color32, egui::Color32, f32) {
+    if !enabled {
+        return match kind {
+            ButtonKind::Blue => (BTN_BLUE_DISABLED, BTN_STROKE, 1.5),
+            ButtonKind::Green => (BTN_GREEN_DISABLED, BTN_GREEN_STROKE, 1.5),
+        };
+    }
+
+    if pressed {
+        return match kind {
+            ButtonKind::Blue => (BTN_BLUE_DARK, BTN_STROKE, 2.5),
+            ButtonKind::Green => (
+                egui::Color32::from_rgb(22, 163, 74),
+                BTN_GREEN_STROKE,
+                2.5,
+            ),
+        };
+    }
+
+    match kind {
+        ButtonKind::Blue => {
+            let fill = if hovered {
+                BTN_BLUE_HOVER
+            } else if emphasized {
+                BTN_BLUE_DARK
+            } else {
+                BTN_BLUE
+            };
+            (fill, BTN_STROKE, if hovered || emphasized { 2.5 } else { 2.0 })
+        }
+        ButtonKind::Green => {
+            let fill = if hovered { BTN_GREEN_HOVER } else { BTN_GREEN };
+            (fill, BTN_GREEN_STROKE, if hovered { 2.5 } else { 2.0 })
+        }
+    }
+}
+
+fn glass_fill(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgba_unmultiplied(24, 26, 32, 238)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 232)
+    }
+}
+
+fn glass_border(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(15, 23, 42, 28)
+    }
+}
+
+fn card_fill(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgba_unmultiplied(38, 42, 52, 210)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(255, 251, 235, 220)
+    }
+}
+
+fn app_shell_frame(dark: bool) -> egui::Frame {
+    egui::Frame::new()
+        .fill(glass_fill(dark))
+        .stroke(egui::Stroke::new(1.0_f32, glass_border(dark)))
+        .corner_radius(WINDOW_RADIUS)
+        .outer_margin(egui::Margin::same(10))
+        .inner_margin(egui::Margin::symmetric(18, 16))
+        .shadow(egui::Shadow {
+            offset: [0, 10],
+            blur: 28,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(if dark { 90 } else { 45 }),
+        })
 }
 
 fn apply_theme(ctx: &egui::Context, theme: egui::Theme) {
@@ -888,12 +1046,17 @@ fn apply_theme(ctx: &egui::Context, theme: egui::Theme) {
     visuals.override_text_color = Some(text);
 
     if visuals.dark_mode {
-        visuals.panel_fill = egui::Color32::from_rgb(28, 30, 34);
-        visuals.window_fill = egui::Color32::from_rgb(22, 24, 28);
+        visuals.panel_fill = egui::Color32::TRANSPARENT;
+        visuals.window_fill = egui::Color32::TRANSPARENT;
+        visuals.extreme_bg_color = egui::Color32::from_rgba_unmultiplied(12, 14, 18, 255);
     } else {
-        visuals.panel_fill = egui::Color32::from_rgb(248, 250, 252);
-        visuals.window_fill = egui::Color32::from_rgb(255, 255, 255);
+        visuals.panel_fill = egui::Color32::TRANSPARENT;
+        visuals.window_fill = egui::Color32::TRANSPARENT;
+        visuals.extreme_bg_color = egui::Color32::from_rgba_unmultiplied(241, 245, 249, 255);
     }
+
+    visuals.window_corner_radius = WINDOW_RADIUS.into();
+    visuals.window_stroke = egui::Stroke::NONE;
 
     visuals.selection.bg_fill = BTN_BLUE;
     visuals.selection.stroke.color = BTN_STROKE;
@@ -921,9 +1084,12 @@ fn apply_theme(ctx: &egui::Context, theme: egui::Theme) {
         egui::TextStyle::Small,
         egui::FontId::new(12.0, egui::FontFamily::Proportional),
     );
-    style.spacing.button_padding = egui::vec2(12.0, 8.0);
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(16.0, 10.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.indent = 14.0;
+    style.visuals.widgets.inactive.corner_radius = BTN_RADIUS.into();
+    style.visuals.widgets.hovered.corner_radius = BTN_RADIUS.into();
+    style.visuals.widgets.active.corner_radius = BTN_RADIUS.into();
     ctx.set_style(style);
 }
 
@@ -945,6 +1111,7 @@ pub fn run(identity: Identity, trust: TrustStore) -> eframe::Result<()> {
             .with_min_inner_size([W, H])
             .with_max_inner_size([W, H])
             .with_resizable(false)
+            .with_transparent(true)
             .with_title("NTRelay")
             .with_icon(icon),
         ..Default::default()

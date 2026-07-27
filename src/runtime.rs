@@ -2,8 +2,8 @@ use crate::config::{Identity, TrustStore};
 use crate::discovery::{Discovery, pick_listen_port};
 use crate::peer_registry::{PeerPresence, PeerSnapshot};
 use crate::transfer::{
-    begin_incoming, connect_and_handshake, send_files_on_connection, send_pairing_message,
-    HandshakeResult, IncomingTransfer,
+    connect_and_handshake, dispatch_incoming, send_files_on_connection, send_pairing_message,
+    HandshakeResult, IncomingDispatch, IncomingTransfer,
 };
 use anyhow::{Context, Result};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -19,6 +19,7 @@ pub struct Peer {
     pub addr: SocketAddr,
     pub presence: PeerPresence,
     pub is_new: bool,
+    pub reachable: bool,
 }
 
 pub enum RuntimeEvent {
@@ -135,7 +136,7 @@ fn peer_loop(
     port: u16,
     event_tx: Sender<RuntimeEvent>,
 ) {
-    let discovery = match Discovery::start(&identity.device_id, &identity.name, port) {
+    let mut discovery = match Discovery::start(&identity.device_id, &identity.name, port) {
         Ok(d) => d,
         Err(err) => {
             let _ = event_tx.send(RuntimeEvent::Log(format!("discovery error: {err}")));
@@ -189,8 +190,9 @@ fn listen_loop(
                 let event_tx = event_tx.clone();
                 thread::spawn(move || {
                     let trust = trust.lock().expect("trust lock");
-                    match begin_incoming(&id, &trust, stream) {
-                        Ok(incoming) => {
+                    match dispatch_incoming(&id, &trust, stream) {
+                        Ok(IncomingDispatch::Probe) => {}
+                        Ok(IncomingDispatch::Transfer(incoming)) => {
                             let _ = event_tx.send(RuntimeEvent::IncomingConnection {
                                 remote_name: incoming.remote.name.clone(),
                                 pairing_code: incoming.pairing_code.clone(),
@@ -396,6 +398,7 @@ fn snapshot_to_peer(snapshot: PeerSnapshot) -> Peer {
         addr: snapshot.addr,
         presence: snapshot.presence,
         is_new: snapshot.is_new,
+        reachable: snapshot.reachable,
     }
 }
 
@@ -412,6 +415,7 @@ mod tests {
             addr: SocketAddr::from(([192, 168, 1, 1], 9000)),
             presence,
             is_new,
+            reachable: presence == PeerPresence::Online,
         }
     }
 

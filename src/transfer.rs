@@ -32,6 +32,11 @@ pub struct HandshakeResult {
     pub needs_pairing_confirm: bool,
 }
 
+pub enum IncomingDispatch {
+    Probe,
+    Transfer(IncomingTransfer),
+}
+
 pub struct IncomingTransfer {
     stream: TcpStream,
     cipher: ChaCha20Poly1305,
@@ -175,6 +180,67 @@ pub fn begin_incoming(
     configure_stream(&stream)?;
     let (remote, cipher, needs_pairing, expect_pairing) =
         receive_handshake(identity, trust, stream.try_clone()?)?;
+    finish_incoming(identity, trust, stream, remote, cipher, needs_pairing, expect_pairing)
+}
+
+/// Classify an inbound TCP connection as probe or file transfer.
+pub fn dispatch_incoming(
+    identity: &Identity,
+    trust: &TrustStore,
+    mut stream: TcpStream,
+) -> Result<IncomingDispatch> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .context("set probe classify read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .context("set probe classify write timeout")?;
+
+    let first = read_plain(&mut stream, "classify inbound connection")?;
+    match first {
+        WireMessage::Control(ControlMessage::Ping { .. }) => {
+            crate::probe::respond_to_probe(&mut stream)?;
+            Ok(IncomingDispatch::Probe)
+        }
+        WireMessage::Control(ControlMessage::Hello(remote)) => {
+            validate_remote_hello(trust, &remote)?;
+            let pairing_required = requires_pairing(trust, &remote);
+            let hello = build_hello(identity, pairing_required);
+            write_plain(
+                &mut stream,
+                &WireMessage::Control(ControlMessage::Hello(hello)),
+                "send hello",
+            )?;
+            let remote_pk = decode_pubkey(&remote.public_key)?;
+            let cipher = session_cipher(&identity.secret(), &remote_pk);
+            let needs_pairing = pairing_required;
+            let expect_pairing = requires_pairing(trust, &remote);
+            configure_stream(&stream)?;
+            let transfer = finish_incoming(
+                identity,
+                trust,
+                stream,
+                remote,
+                cipher,
+                needs_pairing,
+                expect_pairing,
+            )?;
+            Ok(IncomingDispatch::Transfer(transfer))
+        }
+        other => Err(anyhow!("unexpected first message on inbound connection: {other:?}")),
+    }
+}
+
+fn finish_incoming(
+    identity: &Identity,
+    trust: &TrustStore,
+    stream: TcpStream,
+    remote: Hello,
+    cipher: ChaCha20Poly1305,
+    needs_pairing: bool,
+    expect_pairing: bool,
+) -> Result<IncomingTransfer> {
+    let _ = (identity, trust);
     let remote_pk = decode_pubkey(&remote.public_key)?;
     let code = pairing_code(&identity.public_key(), &remote_pk);
     Ok(IncomingTransfer {
