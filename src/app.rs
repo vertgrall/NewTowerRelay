@@ -21,7 +21,6 @@ const RED: egui::Color32 = egui::Color32::from_rgb(220, 38, 38);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(180, 120, 0);
 const INTER_SEMIBOLD: &str = "inter-semibold";
 const BTN_RADIUS: f32 = 12.0;
-const WINDOW_RADIUS: f32 = 18.0;
 const CARD_RADIUS: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -683,8 +682,8 @@ impl RelayApp {
 }
 
 impl eframe::App for RelayApp {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Rgba::TRANSPARENT.to_array()
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::from(glass_fill(visuals.dark_mode)).to_array()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1065,14 +1064,6 @@ fn glass_fill(dark: bool) -> egui::Color32 {
     }
 }
 
-fn glass_border(dark: bool) -> egui::Color32 {
-    if dark {
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28)
-    } else {
-        egui::Color32::from_rgba_unmultiplied(15, 23, 42, 28)
-    }
-}
-
 fn card_fill(dark: bool) -> egui::Color32 {
     if dark {
         egui::Color32::from_rgba_unmultiplied(38, 42, 52, 210)
@@ -1084,16 +1075,7 @@ fn card_fill(dark: bool) -> egui::Color32 {
 fn app_shell_frame(dark: bool) -> egui::Frame {
     egui::Frame::new()
         .fill(glass_fill(dark))
-        .stroke(egui::Stroke::new(1.0_f32, glass_border(dark)))
-        .corner_radius(WINDOW_RADIUS)
-        .outer_margin(egui::Margin::same(10))
         .inner_margin(egui::Margin::symmetric(18, 16))
-        .shadow(egui::Shadow {
-            offset: [0, 10],
-            blur: 28,
-            spread: 0,
-            color: egui::Color32::from_black_alpha(if dark { 90 } else { 45 }),
-        })
 }
 
 fn apply_theme(ctx: &egui::Context, theme: egui::Theme) {
@@ -1112,14 +1094,14 @@ fn apply_theme(ctx: &egui::Context, theme: egui::Theme) {
     if visuals.dark_mode {
         visuals.panel_fill = egui::Color32::TRANSPARENT;
         visuals.window_fill = egui::Color32::TRANSPARENT;
-        visuals.extreme_bg_color = egui::Color32::from_rgba_unmultiplied(12, 14, 18, 255);
+        visuals.extreme_bg_color = glass_fill(true);
     } else {
         visuals.panel_fill = egui::Color32::TRANSPARENT;
         visuals.window_fill = egui::Color32::TRANSPARENT;
-        visuals.extreme_bg_color = egui::Color32::from_rgba_unmultiplied(241, 245, 249, 255);
+        visuals.extreme_bg_color = glass_fill(false);
     }
 
-    visuals.window_corner_radius = WINDOW_RADIUS.into();
+    visuals.window_corner_radius = egui::CornerRadius::ZERO;
     visuals.window_stroke = egui::Stroke::NONE;
 
     visuals.selection.bg_fill = BTN_BLUE;
@@ -1175,7 +1157,6 @@ pub fn run(identity: Identity, trust: TrustStore) -> eframe::Result<()> {
             .with_min_inner_size([W, H])
             .with_max_inner_size([W, H])
             .with_resizable(false)
-            .with_transparent(true)
             .with_title("NTRelay")
             .with_icon(icon),
         ..Default::default()
